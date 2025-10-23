@@ -9,6 +9,7 @@ from database.connection import get_async_session
 from config import settings
 from utils.logger import logger
 import asyncio
+from datetime import datetime, timedelta
 
 router = Router()
 
@@ -21,7 +22,7 @@ async def payment_handler(callback: CallbackQuery, state: FSMContext):
             await callback.answer("❌ Неверный формат запроса!", show_alert=True)
             return
         user_id = int(parts[1])
-        image_key = parts[2]  # Endi key str
+        image_key = parts[2]
 
         data = await state.get_data()
         images = data.get("images", {})
@@ -42,6 +43,12 @@ async def payment_handler(callback: CallbackQuery, state: FSMContext):
         async for session in get_async_session():
             invoice_url, invoice_id = await PaymentService.create_invoice(session, user_id)
 
+        # Invoice yaratilgan vaqtni saqlash
+        invoice_created_at = datetime.now()
+        images[image_key]['invoice_id'] = invoice_id
+        images[image_key]['invoice_created_at'] = invoice_created_at
+        await state.update_data(images=images)
+
         markup = get_payment_keyboard(invoice_url)
         msg = await callback.message.answer("💳 Перейдите по ссылке для оплаты:", reply_markup=markup)
         await callback.answer()
@@ -53,7 +60,9 @@ async def payment_handler(callback: CallbackQuery, state: FSMContext):
                 state=state,
                 bot=callback.bot,
                 payment_message_id=msg.message_id,
-                image_key=image_key 
+                image_key=image_key,
+                result_message_id=callback.message.message_id,
+                invoice_created_at=invoice_created_at
             )
         )
 
@@ -64,12 +73,33 @@ async def payment_handler(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_reply_markup(reply_markup=markup)
 
 
-async def poll_for_payment(telegram_id: int, invoice_id: str, state: FSMContext, bot, payment_message_id: int, image_key: str):  # Key str
-
-    while True:
-        await asyncio.sleep(10) 
+async def poll_for_payment(
+    telegram_id: int, 
+    invoice_id: str, 
+    state: FSMContext, 
+    bot, 
+    payment_message_id: int, 
+    image_key: str,
+    result_message_id: int,
+    invoice_created_at: datetime
+):
+    max_wait_time = timedelta(minutes=10)
+    check_interval = 10  # sekundda
+    max_checks = int(max_wait_time.total_seconds() / check_interval)
+    
+    for check_count in range(max_checks):
+        await asyncio.sleep(check_interval)
+        
+        # Invoice hali aktiv ekanligini tekshirish
+        elapsed_time = datetime.now() - invoice_created_at
+        if elapsed_time >= max_wait_time:
+            logger.info(f"Invoice {invoice_id} expired after 10 minutes")
+            break
+        
         async for session in get_async_session():
-            if await PaymentService.check_status(session, invoice_id):
+            payment_status = await PaymentService.check_status(session, invoice_id)
+            
+            if payment_status:
                 try:
                     await bot.edit_message_text(
                         chat_id=telegram_id,
@@ -111,6 +141,12 @@ async def poll_for_payment(telegram_id: int, invoice_id: str, state: FSMContext,
                     await state.update_data(images=images)
                     logger.info(f"Payment completed for key {image_key}, updated paid=True")
 
+                # To'lov xabarini o'chirish
+                try:
+                    await bot.delete_message(telegram_id, payment_message_id)
+                except:
+                    pass
+
                 await asyncio.sleep(2)
                 await bot.send_message(
                     telegram_id,
@@ -119,6 +155,36 @@ async def poll_for_payment(telegram_id: int, invoice_id: str, state: FSMContext,
                     f"💰 Стоимость обработки: {settings.price}₽"
                 )
                 return
+    
+    # 10 minut o'tdi, to'lov qilinmagan
+    logger.info(f"Invoice {invoice_id} expired without payment")
+    
+    try:
+        # To'lov xabarini o'chirish
+        await bot.delete_message(telegram_id, payment_message_id)
+    except Exception as e:
+        logger.error(f"Failed to delete payment message: {e}")
+    
+    # Result message tugmasini yangilash - qayta to'lov qilish imkoniyati
+    try:
+        expired_markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Создать новый счет", callback_data=f"pay_{telegram_id}_{image_key}")],
+            [InlineKeyboardButton(text="Не нравится результат", callback_data="not_like")]
+        ])
+        await bot.edit_message_reply_markup(
+            chat_id=telegram_id,
+            message_id=result_message_id,
+            reply_markup=expired_markup
+        )
+        
+        await bot.send_message(
+            telegram_id,
+            "⏰ Время оплаты истекло. Счет больше не действителен.\n"
+            "Нажмите '🔄 Создать новый счет' для повторной оплаты."
+        )
+    except Exception as e:
+        logger.error(f"Failed to update expired invoice message: {e}")
+
 
 @router.callback_query(F.data == "not_like")
 async def not_like_handler(callback: CallbackQuery):
@@ -129,8 +195,51 @@ async def not_like_handler(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("pay_processing_"))
-async def pay_processing_handler(callback: CallbackQuery):
-    await callback.answer("⏳ Оплата в процессе. Пожалуйста, подождите подтверждения.", show_alert=True)
+async def pay_processing_handler(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_", 3)
+    if len(parts) < 4:
+        await callback.answer("⏳ Оплата в процессе. Пожалуйста, подождите подтверждения.", show_alert=True)
+        return
+    
+    user_id = int(parts[2])
+    image_key = parts[3]
+    
+    data = await state.get_data()
+    images = data.get("images", {})
+    
+    if image_key not in images:
+        await callback.answer("❌ Изображение не найдено!", show_alert=True)
+        return
+    
+    img_data = images[image_key]
+    invoice_created_at = img_data.get('invoice_created_at')
+    
+    if invoice_created_at:
+        elapsed = datetime.now() - invoice_created_at
+        if elapsed >= timedelta(minutes=10):
+            # Invoice muddati o'tgan
+            await callback.answer(
+                "⏰ Время оплаты истекло. Счет больше не действителен.\n"
+                "Нажмите '🔄 Создать новый счет' для повторной оплаты.",
+                show_alert=True
+            )
+            
+            expired_markup = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Создать новый счет", callback_data=f"pay_{user_id}_{image_key}")],
+                [InlineKeyboardButton(text="Не нравится результат", callback_data="not_like")]
+            ])
+            await callback.message.edit_reply_markup(reply_markup=expired_markup)
+        else:
+            remaining = timedelta(minutes=10) - elapsed
+            minutes = int(remaining.total_seconds() // 60)
+            seconds = int(remaining.total_seconds() % 60)
+            await callback.answer(
+                f"⏳ Оплата в процессе. Подождите подтверждения.\n"
+                f"Осталось времени: {minutes}м {seconds}с",
+                show_alert=True
+            )
+    else:
+        await callback.answer("⏳ Оплата в процессе. Пожалуйста, подождите подтверждения.", show_alert=True)
 
 
 @router.callback_query(F.data == "paid_done")
